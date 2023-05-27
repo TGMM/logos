@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use super::internal::LexerInternal;
 use super::Logos;
 use crate::source::{self, Source};
@@ -14,8 +16,10 @@ pub type Span = core::ops::Range<usize>;
 pub struct Lexer<'source, Token: Logos<'source>> {
     source: &'source Token::Source,
     token: ManuallyDrop<Option<Result<Token, Token::Error>>>,
+    intermediate_tokens: VecDeque<(Option<Result<Token, Token::Error>>, Span)>,
     token_start: usize,
     token_end: usize,
+    span_token_end: usize,
 
     /// Extras associated with the `Token`.
     pub extras: Token::Extras,
@@ -55,9 +59,11 @@ impl<'source, Token: Logos<'source>> Lexer<'source, Token> {
         Lexer {
             source,
             token: ManuallyDrop::new(None),
+            intermediate_tokens: VecDeque::new(),
             extras,
             token_start: 0,
             token_end: 0,
+            span_token_end: 0,
         }
     }
 
@@ -134,7 +140,7 @@ impl<'source, Token: Logos<'source>> Lexer<'source, Token> {
     /// Get the range for the current token in `Source`.
     #[inline]
     pub fn span(&self) -> Span {
-        self.token_start..self.token_end
+        self.token_start..self.span_token_end
     }
 
     /// Get a string slice of the current token.
@@ -164,9 +170,11 @@ impl<'source, Token: Logos<'source>> Lexer<'source, Token> {
         Lexer {
             source: self.source,
             token: ManuallyDrop::new(None),
+            intermediate_tokens: VecDeque::new(),
             extras: self.extras.into(),
             token_start: self.token_start,
             token_end: self.token_end,
+            span_token_end: self.span_token_end,
         }
     }
 
@@ -178,11 +186,32 @@ impl<'source, Token: Logos<'source>> Lexer<'source, Token> {
     /// or in the middle of an UTF-8 code point (does not apply when lexing raw `&[u8]`).
     pub fn bump(&mut self, n: usize) {
         self.token_end += n;
+        self.span_token_end += n;
 
         assert!(
             self.source.is_boundary(self.token_end),
             "Invalid Lexer bump",
         )
+    }
+
+    /// Bumps the lexer by `n` bytes but not the end of the spanned token.
+    ///
+    /// # Panics
+    ///
+    /// Panics if adding `n` to current offset would place the `Lexer` beyond the last byte,
+    /// or in the middle of an UTF-8 code point (does not apply when lexing raw `&[u8]`).
+    pub fn bump_no_span(&mut self, n: usize) {
+        self.token_end += n;
+
+        assert!(
+            self.source.is_boundary(self.token_end),
+            "Invalid Lexer bump",
+        )
+    }
+
+    /// Adds a token to the intermediate token queue
+    pub fn add_intermediate_token(&mut self, tok: Option<Result<Token, Token::Error>>, span: Span) {
+        self.intermediate_tokens.push_front((tok, span));
     }
 }
 
@@ -195,6 +224,7 @@ where
         Lexer {
             extras: self.extras.clone(),
             token: self.token.clone(),
+            intermediate_tokens: self.intermediate_tokens.clone(),
             ..*self
         }
     }
@@ -208,8 +238,15 @@ where
 
     #[inline]
     fn next(&mut self) -> Option<Result<Token, Token::Error>> {
-        self.token_start = self.token_end;
+        if let Some((int_tok, span)) = self.intermediate_tokens.pop_back() {
+            self.token_start = span.start;
+            self.span_token_end = span.end;
 
+            return int_tok;
+        }
+
+        self.token_start = self.token_end;
+        self.span_token_end = self.token_end;
         Token::lex(self);
 
         // This basically treats self.token as a temporary field.
@@ -331,6 +368,7 @@ where
         );
 
         self.token_end += size;
+        self.span_token_end += size;
     }
 
     /// Reset `token_start` to `token_end`.
@@ -344,6 +382,7 @@ where
     #[inline]
     fn error(&mut self) {
         self.token_end = self.source.find_boundary(self.token_end);
+        self.span_token_end = self.token_end;
         self.token = ManuallyDrop::new(Some(Err(Token::Error::default())));
     }
 
